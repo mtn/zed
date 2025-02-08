@@ -3106,102 +3106,200 @@ impl Workspace {
         window: &mut Window,
         cx: &mut App,
     ) {
+        // For horizontal moves (Left/Right) we want circular navigation.
+        if direction == SplitDirection::Left || direction == SplitDirection::Right {
+            // Define a local enum for our candidate items.
+            #[derive(Clone)]
+            enum Candidate {
+                Editor(Entity<Pane>),
+                FileTree(Arc<dyn PanelHandle>), // file tree candidate from the right dock
+            }
+            // Build candidate list: first add all center (editor) panes.
+            let mut candidates: Vec<Candidate> = self
+                .center
+                .panes()
+                .iter()
+                .map(|pane_ref| Candidate::Editor((**pane_ref).clone()))
+                .collect();
+            // We assume that self.center.panes() is in left-to-right order.
+            // (If not, adjust by sorting or reversing accordingly.)
+            // Now, if the right dock (the file tree) is open, add its active panel candidate.
+            if self.right_dock.read(cx).is_open() {
+                if let Some(panel_handle) = self.right_dock.read(cx).active_panel() {
+                    // Instead of downcasting (which was failing) we simply keep the panel handle.
+                    candidates.push(Candidate::FileTree(panel_handle.clone()));
+                    log::info!("Added file tree candidate from right dock.");
+                } else {
+                    log::warn!("Right dock is open but no active panel found.");
+                }
+            }
+            log::info!("Horizontal candidate count: {}", candidates.len());
+            if !candidates.is_empty() {
+                // Determine the index of the currently focused candidate.
+                // If our current focus is in the center, we compare against self.active_pane().
+                // Otherwise, if the right dock is focused, we assume the current candidate is the FileTree candidate.
+                let current_candidate_index = if self
+                    .right_dock
+                    .focus_handle(cx)
+                    .contains_focused(window, cx)
+                {
+                    // If the right dock is focused, find the FileTree candidate.
+                    candidates
+                        .iter()
+                        .position(|cand| match cand {
+                            Candidate::FileTree(_) => true,
+                            _ => false,
+                        })
+                        .unwrap_or(0)
+                } else {
+                    // Otherwise, get the current center pane candidate.
+                    let current = self.active_pane();
+                    candidates
+                        .iter()
+                        .position(|cand| match cand {
+                            Candidate::Editor(p) => p.entity_id() == current.entity_id(),
+                            _ => false,
+                        })
+                        .unwrap_or(0)
+                };
+                log::info!("Current candidate index: {}", current_candidate_index);
+                // Compute new index modulo candidate count.
+                let new_index = if direction == SplitDirection::Right {
+                    (current_candidate_index + 1) % candidates.len()
+                } else {
+                    (current_candidate_index + candidates.len() - 1) % candidates.len()
+                };
+                log::info!(
+                    "New candidate index: {} (direction {:?})",
+                    new_index,
+                    direction
+                );
+                // Focus the candidate based on its variant.
+                match &candidates[new_index] {
+                    Candidate::Editor(p) => {
+                        window.focus(&p.focus_handle(cx));
+                    }
+                    Candidate::FileTree(panel_handle) => {
+                        window.focus(&panel_handle.panel_focus_handle(cx));
+                    }
+                }
+                return;
+            } else {
+                log::info!("No horizontal candidates found in center.");
+            }
+        }
+
+        // Non-horizontal directions -- fallback to the previous logic.
         use ActivateInDirectionTarget as Target;
+        #[derive(Clone, Copy, Debug)]
         enum Origin {
             LeftDock,
             RightDock,
             BottomDock,
             Center,
         }
-
         let origin: Origin = [
             (&self.left_dock, Origin::LeftDock),
             (&self.right_dock, Origin::RightDock),
             (&self.bottom_dock, Origin::BottomDock),
         ]
-        .into_iter()
-        .find_map(|(dock, origin)| {
+        .iter()
+        .find_map(|(dock, orig)| {
             if dock.focus_handle(cx).contains_focused(window, cx) && dock.read(cx).is_open() {
-                Some(origin)
+                Some(*orig)
             } else {
                 None
             }
         })
         .unwrap_or(Origin::Center);
+        log::info!("Origin: {:?}", origin);
 
+        // Helper: get a strong Entity<Pane> for the last active center pane.
         let get_last_active_pane = || {
-            let pane = self
-                .last_active_center_pane
+            self.last_active_center_pane
                 .clone()
+                .and_then(|weak| weak.upgrade())
                 .unwrap_or_else(|| {
-                    self.panes
+                    (*self
+                        .center
+                        .panes()
                         .first()
-                        .expect("There must be an active pane")
-                        .downgrade()
+                        .expect("There must be an active pane"))
+                    .clone()
                 })
-                .upgrade()?;
-            (pane.read(cx).items_len() != 0).then_some(pane)
         };
 
-        let try_dock =
-            |dock: &Entity<Dock>| dock.read(cx).is_open().then(|| Target::Dock(dock.clone()));
+        // Helper: if a given dock is open, return its active panel as a target.
+        let try_dock = |dock: &Entity<Dock>| {
+            if dock.read(cx).is_open() {
+                Some(Target::Dock(dock.clone()))
+            } else {
+                None
+            }
+        };
 
         let target = match (origin, direction) {
-            // We're in the center, so we first try to go to a different pane,
-            // otherwise try to go to a dock.
-            (Origin::Center, direction) => {
+            (Origin::Center, _) => {
                 if let Some(pane) = self.find_pane_in_direction(direction, cx) {
                     Some(Target::Pane(pane))
                 } else {
-                    match direction {
-                        SplitDirection::Up => None,
+                    let dock_target = match direction {
                         SplitDirection::Down => try_dock(&self.bottom_dock),
                         SplitDirection::Left => try_dock(&self.left_dock),
                         SplitDirection::Right => try_dock(&self.right_dock),
+                        _ => None,
+                    };
+                    if dock_target.is_some() {
+                        dock_target
+                    } else {
+                        let panes = self.center.panes();
+                        if panes.is_empty() {
+                            None
+                        } else {
+                            match direction {
+                                SplitDirection::Right => {
+                                    Some(Target::Pane((**panes.first().unwrap()).clone()))
+                                }
+                                SplitDirection::Left => {
+                                    Some(Target::Pane((**panes.last().unwrap()).clone()))
+                                }
+                                _ => None,
+                            }
+                        }
                     }
                 }
             }
-
-            (Origin::LeftDock, SplitDirection::Right) => {
-                if let Some(last_active_pane) = get_last_active_pane() {
-                    Some(Target::Pane(last_active_pane))
-                } else {
-                    try_dock(&self.bottom_dock).or_else(|| try_dock(&self.right_dock))
-                }
+            (Origin::LeftDock, SplitDirection::Right) => Some(Target::Pane(get_last_active_pane())),
+            (Origin::LeftDock, SplitDirection::Left) => Some(Target::Pane(get_last_active_pane())),
+            (Origin::LeftDock, SplitDirection::Down) => try_dock(&self.bottom_dock),
+            (Origin::RightDock, SplitDirection::Left) => Some(Target::Pane(get_last_active_pane())),
+            (Origin::RightDock, SplitDirection::Right) => {
+                Some(Target::Pane(get_last_active_pane()))
             }
-
-            (Origin::LeftDock, SplitDirection::Down)
-            | (Origin::RightDock, SplitDirection::Down) => try_dock(&self.bottom_dock),
-
-            (Origin::BottomDock, SplitDirection::Up) => get_last_active_pane().map(Target::Pane),
+            (Origin::RightDock, SplitDirection::Down) => try_dock(&self.bottom_dock),
+            (Origin::BottomDock, SplitDirection::Up) => Some(Target::Pane(get_last_active_pane())),
             (Origin::BottomDock, SplitDirection::Left) => try_dock(&self.left_dock),
             (Origin::BottomDock, SplitDirection::Right) => try_dock(&self.right_dock),
-
-            (Origin::RightDock, SplitDirection::Left) => {
-                if let Some(last_active_pane) = get_last_active_pane() {
-                    Some(Target::Pane(last_active_pane))
-                } else {
-                    try_dock(&self.bottom_dock).or_else(|| try_dock(&self.left_dock))
-                }
-            }
-
             _ => None,
         };
+        log::info!(
+            "Fallback target: {:?}",
+            target.as_ref().map(|t| match t {
+                Target::Pane(p) => format!("Pane {:?}", p.entity_id()),
+                Target::Dock(_) => "Dock".to_string(),
+            })
+        );
 
         match target {
-            Some(ActivateInDirectionTarget::Pane(pane)) => {
+            Some(Target::Pane(pane)) => {
                 window.focus(&pane.focus_handle(cx));
             }
-            Some(ActivateInDirectionTarget::Dock(dock)) => {
-                // Defer this to avoid a panic when the dock's active panel is already on the stack.
+            Some(Target::Dock(dock)) => {
                 window.defer(cx, move |window, cx| {
-                    let dock = dock.read(cx);
-                    if let Some(panel) = dock.active_panel() {
-                        panel.panel_focus_handle(cx).focus(window);
-                    } else {
-                        log::error!("Could not find a focus target when in switching focus in {direction} direction for a {:?} dock", dock.position());
+                    if let Some(panel) = dock.read(cx).active_panel() {
+                        window.focus(&panel.panel_focus_handle(cx));
                     }
-                })
+                });
             }
             None => {}
         }
