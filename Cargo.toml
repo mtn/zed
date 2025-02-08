@@ -688,6 +688,7 @@ workspace-hack = { path = "tooling/workspace-hack" }
 
 [profile.dev]
 split-debuginfo = "unpacked"
+debug = true
 codegen-units = 16
 
 [profile.dev.package]
