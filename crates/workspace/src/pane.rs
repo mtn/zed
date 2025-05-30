@@ -20,7 +20,7 @@ use gpui::{
     DragMoveEvent, Entity, EntityId, EventEmitter, ExternalPaths, FocusHandle, FocusOutEvent,
     Focusable, KeyContext, MouseButton, MouseDownEvent, NavigationDirection, Pixels, Point,
     PromptLevel, Render, ScrollHandle, Subscription, Task, WeakEntity, WeakFocusHandle, Window,
-    actions, anchored, deferred, impl_actions, prelude::*,
+    actions, anchored, deferred, impl_actions, prelude::*, Hsla,
 };
 use itertools::Itertools;
 use language::DiagnosticSeverity;
@@ -335,6 +335,8 @@ pub struct Pane {
     zoom_out_on_close: bool,
     /// If a certain project item wants to get recreated with specific data, it can persist its data before the recreation here.
     pub project_item_restoration_data: HashMap<ProjectItemKind, Box<dyn Any + Send>>,
+    #[cfg(debug_assertions)]
+    debug_color: Hsla,
 }
 
 pub struct ActivationHistoryEntry {
@@ -462,6 +464,8 @@ impl Pane {
             diagnostics: Default::default(),
             zoom_out_on_close: true,
             project_item_restoration_data: HashMap::default(),
+            #[cfg(debug_assertions)]
+            debug_color: crate::random_debug_color(),
         }
     }
 
@@ -3199,6 +3203,13 @@ impl Render for Pane {
             .size_full()
             .flex_none()
             .overflow_hidden()
+            .when(
+                cfg!(debug_assertions),
+                |this| {
+                    this.border_2()
+                        .border_color(Color::Custom(self.debug_color))
+                },
+            )
             .on_action(cx.listener(|pane, _: &AlternateFile, window, cx| {
                 pane.alternate_file(window, cx);
             }))

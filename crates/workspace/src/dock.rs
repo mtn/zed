@@ -7,7 +7,7 @@ use gpui::{
     Action, AnyView, App, Axis, Context, Corner, Entity, EntityId, EventEmitter, FocusHandle,
     Focusable, IntoElement, KeyContext, MouseButton, MouseDownEvent, MouseUpEvent, ParentElement,
     Render, SharedString, StyleRefinement, Styled, Subscription, WeakEntity, Window, deferred, div,
-    px,
+    px, Hsla,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -204,6 +204,8 @@ pub struct Dock {
     zoom_layer_open: bool,
     modal_layer: Entity<ModalLayer>,
     _subscriptions: [Subscription; 2],
+    #[cfg(debug_assertions)]
+    debug_color: Hsla,
 }
 
 impl Focusable for Dock {
@@ -280,6 +282,8 @@ impl Dock {
                 serialized_dock: None,
                 zoom_layer_open: false,
                 modal_layer,
+                #[cfg(debug_assertions)]
+                debug_color: crate::random_debug_color(),
             }
         });
 
@@ -786,6 +790,13 @@ impl Render for Dock {
                 .flex()
                 .bg(cx.theme().colors().panel_background)
                 .border_color(cx.theme().colors().border)
+                .when(
+                    cfg!(debug_assertions),
+                    |this| {
+                        this.border_2()
+                            .border_color(Color::Custom(self.debug_color))
+                    },
+                )
                 .overflow_hidden()
                 .map(|this| match self.position().axis() {
                     Axis::Horizontal => this.w(size).h_full().flex_row(),

@@ -62,6 +62,7 @@ telemetry.workspace = true
 theme.workspace = true
 ui.workspace = true
 util.workspace = true
+rand.workspace = true
 uuid.workspace = true
 zed_actions.workspace = true
 workspace-hack.workspace = true
