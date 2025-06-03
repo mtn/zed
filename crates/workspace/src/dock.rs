@@ -5,14 +5,17 @@ use anyhow::Context as _;
 use client::proto;
 use gpui::{
     Action, AnyView, App, Axis, Context, Corner, Entity, EntityId, EventEmitter, FocusHandle,
-    Focusable, IntoElement, KeyContext, MouseButton, MouseDownEvent, MouseUpEvent, ParentElement,
-    Render, SharedString, StyleRefinement, Styled, Subscription, WeakEntity, Window, deferred, div,
-    px,
+    Focusable, IntoElement, KeyContext, MouseButton, MouseDownEvent, MouseUpEvent,
+    ParentElement, Render, SharedString, StyleRefinement, Styled, Subscription, WeakEntity, Window,
+    deferred, div, px,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use settings::SettingsStore;
 use std::sync::Arc;
+
+#[cfg(debug_assertions)]
+use gpui::Hsla;
 use ui::{ContextMenu, Divider, DividerColor, IconButton, Tooltip, h_flex};
 use ui::{prelude::*, right_click_menu};
 
@@ -195,6 +198,8 @@ pub struct Dock {
     position: DockPosition,
     panel_entries: Vec<PanelEntry>,
     workspace: WeakEntity<Workspace>,
+    /// Last time *any* panel in this dock gained focus.
+    pub(crate) last_visit_ts: usize,
     is_open: bool,
     active_panel_index: Option<usize>,
     focus_handle: FocusHandle,
@@ -202,6 +207,8 @@ pub struct Dock {
     zoom_layer_open: bool,
     modal_layer: Entity<ModalLayer>,
     _subscriptions: [Subscription; 2],
+    #[cfg(debug_assertions)]
+    pub(crate) debug_color: Hsla,
 }
 
 impl Focusable for Dock {
@@ -244,6 +251,19 @@ pub struct PanelButtons {
     dock: Entity<Dock>,
 }
 
+#[cfg(debug_assertions)]
+fn debug_color_for_dock(position: DockPosition) -> Hsla {
+    // Use hex values for explicit RGB colors
+    let (color_hex, name) = match position {
+        DockPosition::Left => (0xFF0000FF, "red"),     // Pure red
+        DockPosition::Right => (0x00FF00FF, "green"),  // Pure green
+        DockPosition::Bottom => (0x8000FFFF, "purple"), // Purple
+    };
+    
+    println!("Dock {:?} assigned color {} (hex: 0x{:08X})", position, name, color_hex);
+    gpui::rgba(color_hex).into()
+}
+
 impl Dock {
     pub fn new(
         position: DockPosition,
@@ -273,10 +293,17 @@ impl Dock {
                 active_panel_index: None,
                 is_open: false,
                 focus_handle: focus_handle.clone(),
+                last_visit_ts: 0,
                 _subscriptions: [focus_subscription, zoom_subscription],
                 serialized_dock: None,
                 zoom_layer_open: false,
                 modal_layer,
+                #[cfg(debug_assertions)]
+                debug_color: {
+                    let color = debug_color_for_dock(position);
+                    println!("Creating dock {:?} with color {:?} (hue: {})", position, color, color.h);
+                    color
+                },
             }
         });
 
@@ -782,7 +809,16 @@ impl Render for Dock {
                 .track_focus(&self.focus_handle(cx))
                 .flex()
                 .bg(cx.theme().colors().panel_background)
-                .border_color(cx.theme().colors().border)
+                .border_color({
+                    #[cfg(debug_assertions)]
+                    {
+                        self.debug_color
+                    }
+                    #[cfg(not(debug_assertions))]
+                    {
+                        cx.theme().colors().border
+                    }
+                })
                 .overflow_hidden()
                 .map(|this| match self.position().axis() {
                     Axis::Horizontal => this.w(size).h_full().flex_row(),
@@ -792,6 +828,17 @@ impl Render for Dock {
                     DockPosition::Left => this.border_r_1(),
                     DockPosition::Right => this.border_l_1(),
                     DockPosition::Bottom => this.border_t_1(),
+                })
+                // Re-apply border color after border styles to ensure it's not overridden
+                .border_color({
+                    #[cfg(debug_assertions)]
+                    {
+                        self.debug_color
+                    }
+                    #[cfg(not(debug_assertions))]
+                    {
+                        cx.theme().colors().border
+                    }
                 })
                 .child(
                     div()

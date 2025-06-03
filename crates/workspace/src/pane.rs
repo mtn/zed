@@ -25,6 +25,9 @@ use gpui::{
 use itertools::Itertools;
 use language::DiagnosticSeverity;
 use parking_lot::Mutex;
+
+#[cfg(debug_assertions)]
+use gpui::{Hsla, hsla};
 use project::{Project, ProjectEntryId, ProjectPath, WorktreeId};
 use schemars::JsonSchema;
 use serde::Deserialize;
@@ -290,6 +293,9 @@ pub struct Pane {
     focus_handle: FocusHandle,
     items: Vec<Box<dyn ItemHandle>>,
     activation_history: Vec<ActivationHistoryEntry>,
+    /// Updated each time this pane gains focus.  Used for directional
+    /// navigation tie-breaking.
+    pub(crate) last_visit_ts: usize,
     next_activation_timestamp: Arc<AtomicUsize>,
     zoomed: bool,
     was_focused: bool,
@@ -300,6 +306,8 @@ pub struct Pane {
     toolbar: Entity<Toolbar>,
     pub(crate) workspace: WeakEntity<Workspace>,
     project: WeakEntity<Project>,
+    #[cfg(debug_assertions)]
+    pub(crate) debug_color: Hsla,
     pub drag_split_direction: Option<SplitDirection>,
     can_drop_predicate: Option<Arc<dyn Fn(&dyn Any, &mut Window, &mut App) -> bool>>,
     custom_drop_handle: Option<
@@ -343,6 +351,20 @@ pub struct ItemNavHistory {
     history: NavHistory,
     item: Arc<dyn WeakItemHandle>,
     is_preview: bool,
+}
+
+#[cfg(debug_assertions)]
+fn debug_color_for_pane() -> Hsla {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    static PANE_COLOR_COUNTER: AtomicUsize = AtomicUsize::new(0);
+    const COLOR_COUNT: usize = 12;
+    
+    // Get next color index and wrap around
+    let color_index = PANE_COLOR_COUNTER.fetch_add(1, Ordering::Relaxed) % COLOR_COUNT;
+    
+    // Convert index to hue that will map back to the same index
+    let h = color_index as f32 / COLOR_COUNT as f32;
+    hsla(h, 1.0, 0.5, 1.0)
 }
 
 #[derive(Clone)]
@@ -418,6 +440,7 @@ impl Pane {
             focus_handle,
             items: Vec::new(),
             activation_history: Vec::new(),
+            last_visit_ts: 0,
             next_activation_timestamp: next_timestamp.clone(),
             was_focused: false,
             zoomed: false,
@@ -438,6 +461,8 @@ impl Pane {
             drag_split_direction: None,
             workspace,
             project: project.downgrade(),
+            #[cfg(debug_assertions)]
+            debug_color: debug_color_for_pane(),
             can_drop_predicate,
             custom_drop_handle: None,
             can_split_predicate: None,
@@ -3210,12 +3235,23 @@ impl Render for Pane {
         };
         let is_local = project.read(cx).is_local();
 
-        v_flex()
+        #[cfg(debug_assertions)]
+        let root = v_flex()
             .key_context(key_context)
             .track_focus(&self.focus_handle(cx))
             .size_full()
             .flex_none()
             .overflow_hidden()
+            .border_2()
+            .border_color(self.debug_color);
+        #[cfg(not(debug_assertions))]
+        let root = v_flex()
+            .key_context(key_context)
+            .track_focus(&self.focus_handle(cx))
+            .size_full()
+            .flex_none()
+            .overflow_hidden();
+        root
             .on_action(cx.listener(|pane, _: &AlternateFile, window, cx| {
                 pane.alternate_file(window, cx);
             }))

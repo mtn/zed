@@ -28,6 +28,8 @@ const VERTICAL_MIN_SIZE: f32 = 100.;
 #[derive(Clone)]
 pub struct PaneGroup {
     pub root: Member,
+    /// Bounds for the root when it's a single pane
+    single_pane_bounds: Arc<Mutex<Option<Bounds<Pixels>>>>,
 }
 
 pub struct PaneRenderResult {
@@ -37,12 +39,16 @@ pub struct PaneRenderResult {
 
 impl PaneGroup {
     pub fn with_root(root: Member) -> Self {
-        Self { root }
+        Self { 
+            root,
+            single_pane_bounds: Arc::new(Mutex::new(None)),
+        }
     }
 
     pub fn new(pane: Entity<Pane>) -> Self {
         Self {
             root: Member::Pane(pane),
+            single_pane_bounds: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -67,7 +73,16 @@ impl PaneGroup {
 
     pub fn bounding_box_for_pane(&self, pane: &Entity<Pane>) -> Option<Bounds<Pixels>> {
         match &self.root {
-            Member::Pane(_) => None,
+            Member::Pane(root_pane) => {
+                // For a single pane, check if it matches the requested pane
+                if pane == root_pane {
+                    let bounds = *self.single_pane_bounds.lock();
+                    println!("Single pane matches, bounds: {:?}", bounds);
+                    bounds
+                } else {
+                    None
+                }
+            },
             Member::Axis(axis) => axis.bounding_box_for_pane(pane),
         }
     }
@@ -135,6 +150,11 @@ impl PaneGroup {
     ) -> impl IntoElement {
         self.root.render(0, zoomed, render_cx, window, cx).element
     }
+    
+    /// Set bounds for a single pane (used during layout)
+    pub fn set_single_pane_bounds(&self, bounds: Bounds<Pixels>) {
+        *self.single_pane_bounds.lock() = Some(bounds);
+    }
 
     pub fn panes(&self) -> Vec<&Entity<Pane>> {
         let mut panes = Vec::new();
@@ -150,36 +170,53 @@ impl PaneGroup {
         self.root.last_pane()
     }
 
+    /// Helper function to check if two bounds have vertical overlap
+    fn vertical_overlap(bounds1: Bounds<Pixels>, bounds2: Bounds<Pixels>) -> bool {
+        !(bounds1.bottom() <= bounds2.top() || bounds1.top() >= bounds2.bottom())
+    }
+
+    /// Helper function to check if two bounds have horizontal overlap
+    fn horizontal_overlap(bounds1: Bounds<Pixels>, bounds2: Bounds<Pixels>) -> bool {
+        !(bounds1.right() <= bounds2.left() || bounds1.left() >= bounds2.right())
+    }
+
     pub fn find_pane_in_direction(
         &mut self,
         active_pane: &Entity<Pane>,
         direction: SplitDirection,
         cx: &App,
     ) -> Option<&Entity<Pane>> {
-        let bounding_box = self.bounding_box_for_pane(active_pane)?;
-        let cursor = active_pane.read(cx).pixel_position_of_cursor(cx);
-        let center = match cursor {
-            Some(cursor) if bounding_box.contains(&cursor) => cursor,
-            _ => bounding_box.center(),
-        };
+        let active_bounds = self.bounding_box_for_pane(active_pane)?;
+        let mut best: Option<&Entity<Pane>> = None;
+        let mut best_dist = f32::MAX;
+        let mut best_ts = 0;
 
-        let distance_to_next = crate::HANDLE_HITBOX_SIZE;
+        for pane in self.panes() {
+            if pane == active_pane { continue; }
+            let bounds = match self.bounding_box_for_pane(pane) { Some(b) => b, None => continue };
 
-        let target = match direction {
-            SplitDirection::Left => {
-                Point::new(bounding_box.left() - distance_to_next.into(), center.y)
+            let (overlaps, dist) = match direction {
+                SplitDirection::Right if bounds.left() >= active_bounds.right() =>
+                    (Self::vertical_overlap(bounds, active_bounds), (bounds.left() - active_bounds.right()).0),
+                SplitDirection::Left if bounds.right() <= active_bounds.left()  =>
+                    (Self::vertical_overlap(bounds, active_bounds), (active_bounds.left() - bounds.right()).0),
+                SplitDirection::Down if bounds.top()  >= active_bounds.bottom() =>
+                    (Self::horizontal_overlap(bounds, active_bounds), (bounds.top()  - active_bounds.bottom()).0),
+                SplitDirection::Up   if bounds.bottom() <= active_bounds.top()  =>
+                    (Self::horizontal_overlap(bounds, active_bounds), (active_bounds.top() - bounds.bottom()).0),
+                _ => (false, 0.0),
+            };
+
+            if !overlaps { continue; }
+
+            let ts = pane.read(cx).last_visit_ts;
+            if dist < best_dist || (dist == best_dist && ts > best_ts) {
+                best = Some(pane);
+                best_dist = dist;
+                best_ts = ts;
             }
-            SplitDirection::Right => {
-                Point::new(bounding_box.right() + distance_to_next.into(), center.y)
-            }
-            SplitDirection::Up => {
-                Point::new(center.x, bounding_box.top() - distance_to_next.into())
-            }
-            SplitDirection::Down => {
-                Point::new(center.x, bounding_box.bottom() + distance_to_next.into())
-            }
-        };
-        self.pane_at_pixel_position(target)
+        }
+        best
     }
 
     pub fn invert_axies(&mut self) {

@@ -114,6 +114,33 @@ use crate::persistence::{
     model::{DockData, DockStructure, SerializedItem, SerializedPane, SerializedPaneGroup},
 };
 
+
+#[cfg(debug_assertions)]
+fn debug_color_name(color: Hsla) -> &'static str {
+    let h = color.h;
+    println!("debug_color_name: hue={}", h);
+
+    // Define color names that match the pane color generation
+    const COLOR_NAMES: &[&str] = &[
+        "red",      // 0/12 = 0.0
+        "orange",   // 1/12 = 0.083
+        "yellow",   // 2/12 = 0.167
+        "lime",     // 3/12 = 0.25
+        "green",    // 4/12 = 0.333
+        "teal",     // 5/12 = 0.417
+        "cyan",     // 6/12 = 0.5
+        "blue",     // 7/12 = 0.583
+        "purple",   // 8/12 = 0.667
+        "magenta",  // 9/12 = 0.75
+        "pink",     // 10/12 = 0.833
+        "brown"     // 11/12 = 0.917
+    ];
+
+    // Calculate which color index this hue corresponds to
+    let index = (h * COLOR_NAMES.len() as f32).round() as usize % COLOR_NAMES.len();
+    COLOR_NAMES[index]
+}
+
 pub const SERIALIZATION_THROTTLE_TIME: Duration = Duration::from_millis(200);
 
 static ZED_WINDOW_SIZE: LazyLock<Option<Size<Pixels>>> = LazyLock::new(|| {
@@ -1519,8 +1546,18 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         let focus_handle = panel.panel_focus_handle(cx);
-        cx.on_focus_in(&focus_handle, window, Self::handle_panel_focused)
-            .detach();
+        let dock_for_ts = panel.position(window, cx); // capture
+        cx.on_focus_in(&focus_handle, window, move |this, window, cx| {
+            // update dock timestamp
+            let ts = this
+                .pane_history_timestamp
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let dock = this.dock_at_position(dock_for_ts);
+            dock.update(cx, |dock, _| dock.last_visit_ts = ts);
+
+            Self::handle_panel_focused(this, window, cx);
+        })
+        .detach();
 
         let dock_position = panel.position(window, cx);
         let dock = self.dock_at_position(dock_position);
@@ -3396,111 +3433,481 @@ impl Workspace {
         }
     }
 
+    /// Move focus to the nearest pane / open dock in `direction`,
+    /// using MRU when multiple lie at the same distance.
     pub fn activate_pane_in_direction(
         &mut self,
         direction: SplitDirection,
         window: &mut Window,
         cx: &mut App,
     ) {
-        use ActivateInDirectionTarget as Target;
-        enum Origin {
-            LeftDock,
-            RightDock,
-            BottomDock,
-            Center,
-        }
+        println!("=== activate_pane_in_direction: direction={:?} ===", direction);
+        // Find the origin bounds based on what's currently focused
+        let origin_bounds = {
+            // First check if any dock is focused
+            let all_docks = self.all_docks();
+            let focused_dock = all_docks
+                .iter()
+                .find(|dock| {
+                    // Check both dock focus and panel focus
+                    let dock_focused = dock.focus_handle(cx).contains_focused(window, cx);
+                    let panel_focused = dock.read(cx).active_panel()
+                        .map(|panel| panel.panel_focus_handle(cx).contains_focused(window, cx))
+                        .unwrap_or(false);
+                    let dock_read = dock.read(cx);
+                    let position = dock_read.position();
+                    #[cfg(debug_assertions)]
+                    println!(
+                        "dock {:?} ({}) : dock_focused={}, panel_focused={}",
+                        position,
+                        debug_color_name(dock_read.debug_color),
+                        dock_focused,
+                        panel_focused
+                    );
+                    #[cfg(not(debug_assertions))]
+                    println!(
+                        "dock {:?}: dock_focused={}, panel_focused={}",
+                        position,
+                        dock_focused,
+                        panel_focused
+                    );
+                    dock_focused || panel_focused
+                });
 
-        let origin: Origin = [
-            (&self.left_dock, Origin::LeftDock),
-            (&self.right_dock, Origin::RightDock),
-            (&self.bottom_dock, Origin::BottomDock),
-        ]
-        .into_iter()
-        .find_map(|(dock, origin)| {
-            if dock.focus_handle(cx).contains_focused(window, cx) && dock.read(cx).is_open() {
-                Some(origin)
+            if let Some(dock) = focused_dock {
+                let dock_read = dock.read(cx);
+                let position = dock_read.position();
+                #[cfg(debug_assertions)]
+                println!("focused dock {:?} ({})", position, debug_color_name(dock_read.debug_color));
+                #[cfg(not(debug_assertions))]
+                println!("focused dock {:?}", position);
+                if let Some(bounds) = self.bounding_box_for_dock(dock, window, cx) {
+                    println!("origin bounds from dock {:?}: {:?}", position, bounds);
+                    bounds
+                } else {
+                    println!("dock {:?} has no bounds, falling back to active pane", position);
+                    match self.bounding_box_for_pane(&self.active_pane) {
+                        Some(bounds) => bounds,
+                        None => return,
+                    }
+                }
             } else {
-                None
+                println!("no dock focused, using active pane");
+                match self.bounding_box_for_pane(&self.active_pane) {
+                    Some(bounds) => {
+                        println!("origin bounds from active pane: {:?}", bounds);
+                        bounds
+                    },
+                    None => return,
+                }
             }
-        })
-        .unwrap_or(Origin::Center);
-
-        let get_last_active_pane = || {
-            let pane = self
-                .last_active_center_pane
-                .clone()
-                .unwrap_or_else(|| {
-                    self.panes
-                        .first()
-                        .expect("There must be an active pane")
-                        .downgrade()
-                })
-                .upgrade()?;
-            (pane.read(cx).items_len() != 0).then_some(pane)
         };
 
-        let try_dock =
-            |dock: &Entity<Dock>| dock.read(cx).is_open().then(|| Target::Dock(dock.clone()));
-
-        let target = match (origin, direction) {
-            // We're in the center, so we first try to go to a different pane,
-            // otherwise try to go to a dock.
-            (Origin::Center, direction) => {
-                if let Some(pane) = self.find_pane_in_direction(direction, cx) {
-                    Some(Target::Pane(pane))
-                } else {
-                    match direction {
-                        SplitDirection::Up => None,
-                        SplitDirection::Down => try_dock(&self.bottom_dock),
-                        SplitDirection::Left => try_dock(&self.left_dock),
-                        SplitDirection::Right => try_dock(&self.right_dock),
-                    }
+        if let Some(target) =
+            self.find_focus_target_in_direction(origin_bounds, direction, cx, window)
+        {
+            match target {
+                FocusTarget::Pane(p, _, _) => {
+                    window.focus(&p.focus_handle(cx));
                 }
-            }
-
-            (Origin::LeftDock, SplitDirection::Right) => {
-                if let Some(last_active_pane) = get_last_active_pane() {
-                    Some(Target::Pane(last_active_pane))
-                } else {
-                    try_dock(&self.bottom_dock).or_else(|| try_dock(&self.right_dock))
-                }
-            }
-
-            (Origin::LeftDock, SplitDirection::Down)
-            | (Origin::RightDock, SplitDirection::Down) => try_dock(&self.bottom_dock),
-
-            (Origin::BottomDock, SplitDirection::Up) => get_last_active_pane().map(Target::Pane),
-            (Origin::BottomDock, SplitDirection::Left) => try_dock(&self.left_dock),
-            (Origin::BottomDock, SplitDirection::Right) => try_dock(&self.right_dock),
-
-            (Origin::RightDock, SplitDirection::Left) => {
-                if let Some(last_active_pane) = get_last_active_pane() {
-                    Some(Target::Pane(last_active_pane))
-                } else {
-                    try_dock(&self.bottom_dock).or_else(|| try_dock(&self.left_dock))
-                }
-            }
-
-            _ => None,
-        };
-
-        match target {
-            Some(ActivateInDirectionTarget::Pane(pane)) => {
-                window.focus(&pane.focus_handle(cx));
-            }
-            Some(ActivateInDirectionTarget::Dock(dock)) => {
-                // Defer this to avoid a panic when the dock's active panel is already on the stack.
-                window.defer(cx, move |window, cx| {
-                    let dock = dock.read(cx);
-                    if let Some(panel) = dock.active_panel() {
-                        panel.panel_focus_handle(cx).focus(window);
+                FocusTarget::Dock(d, _, _) => {
+                    let dock_read = d.read(cx);
+                    let position = dock_read.position();
+                    #[cfg(debug_assertions)]
+                    println!("attempting to focus dock {:?} ({})", position, debug_color_name(dock_read.debug_color));
+                    #[cfg(not(debug_assertions))]
+                    println!("attempting to focus dock {:?}", position);
+                    // Get both the active panel and its focus handle in one read operation
+                    let focus_handle = dock_read.active_panel()
+                        .map(|panel| panel.panel_focus_handle(cx));
+                    if let Some(handle) = focus_handle {
+                        #[cfg(debug_assertions)]
+                        println!("focusing panel in dock {:?} ({})", position, debug_color_name(dock_read.debug_color));
+                        #[cfg(not(debug_assertions))]
+                        println!("focusing panel in dock {:?}", position);
+                        handle.focus(window);
                     } else {
-                        log::error!("Could not find a focus target when in switching focus in {direction} direction for a {:?} dock", dock.position());
+                        #[cfg(debug_assertions)]
+                        println!("dock {:?} ({}) has no active panel to focus", position, debug_color_name(dock_read.debug_color));
+                        #[cfg(not(debug_assertions))]
+                        println!("dock {:?} has no active panel to focus", position);
                     }
-                })
+                }
             }
-            None => {}
         }
+    }
+
+    /// Helper function to check if two bounds have vertical overlap
+    fn vertical_overlap(bounds1: Bounds<Pixels>, bounds2: Bounds<Pixels>) -> bool {
+        !(bounds1.bottom() <= bounds2.top() || bounds1.top() >= bounds2.bottom())
+    }
+
+    /// Helper function to check if two bounds have horizontal overlap
+    fn horizontal_overlap(bounds1: Bounds<Pixels>, bounds2: Bounds<Pixels>) -> bool {
+        !(bounds1.right() <= bounds2.left() || bounds1.left() >= bounds2.right())
+    }
+
+    /// Helper function to check if two bounds have significant horizontal overlap (for circular navigation)
+    fn significant_horizontal_overlap(bounds1: Bounds<Pixels>, bounds2: Bounds<Pixels>) -> bool {
+        let overlap_start = bounds1.left().max(bounds2.left());
+        let overlap_end = bounds1.right().min(bounds2.right());
+        if overlap_end <= overlap_start {
+            return false; // No overlap
+        }
+        let overlap_width = overlap_end - overlap_start;
+        let min_width = bounds1.size.width.min(bounds2.size.width);
+        // Require at least 25% overlap of the smaller element's width
+        overlap_width >= min_width * 0.25
+    }
+
+    /// Helper function to check if two bounds have significant vertical overlap (for circular navigation)
+    fn significant_vertical_overlap(bounds1: Bounds<Pixels>, bounds2: Bounds<Pixels>) -> bool {
+        let overlap_start = bounds1.top().max(bounds2.top());
+        let overlap_end = bounds1.bottom().min(bounds2.bottom());
+        if overlap_end <= overlap_start {
+            return false; // No overlap
+        }
+        let overlap_height = overlap_end - overlap_start;
+        let min_height = bounds1.size.height.min(bounds2.size.height);
+        // Require at least 25% overlap of the smaller element's height
+        overlap_height >= min_height * 0.25
+    }
+
+    /// Returns (is_adjacent, distance) for the target bounds in the given direction from origin
+    fn distance_if_adjacent(
+        origin: &Bounds<Pixels>,
+        target: &Bounds<Pixels>,
+        direction: SplitDirection,
+    ) -> (bool, f32) {
+        match direction {
+            SplitDirection::Right if target.left() >= origin.left() && target.right() > origin.right() => (
+                Self::vertical_overlap(*target, *origin),
+                if target.left() >= origin.right() {
+                    (target.left() - origin.right()).0
+                } else {
+                    0.0 // overlapping, but target extends further right
+                }
+            ),
+            SplitDirection::Left if target.right() <= origin.right() && target.left() < origin.left() => (
+                Self::vertical_overlap(*target, *origin),
+                if target.right() <= origin.left() {
+                    (origin.left() - target.right()).0
+                } else {
+                    0.0 // overlapping, but target extends further left
+                }
+            ),
+            SplitDirection::Down if target.top() >= origin.bottom() => (
+                Self::horizontal_overlap(*target, *origin),
+                (target.top() - origin.bottom()).0,
+            ),
+            SplitDirection::Up if target.bottom() <= origin.top() => (
+                Self::horizontal_overlap(*target, *origin),
+                (origin.top() - target.bottom()).0,
+            ),
+            _ => (false, 0.0),
+        }
+    }
+
+    /// Choose the nearest focus target in `direction`, breaking ties by `last_visit_ts`.
+    fn find_focus_target_in_direction<'a>(
+        &'a self,
+        origin: Bounds<Pixels>,
+        direction: SplitDirection,
+        cx: &'a App,
+        window: &'a Window,
+    ) -> Option<FocusTarget<'a>> {
+        let panes = self.center.panes();
+        let panes_iter = panes.iter().filter_map(|p| {
+            self.bounding_box_for_pane(p).map(|b| {
+                #[cfg(debug_assertions)]
+                println!(
+                    "candidate pane {:?} ({}) -> {:?}",
+                    Entity::entity_id(p),
+                    debug_color_name(p.read(cx).debug_color),
+                    b
+                );
+                #[cfg(not(debug_assertions))]
+                println!("candidate pane {:?} -> {:?}", Entity::entity_id(p), b);
+                FocusTarget::Pane(p, b, p.read(cx).last_visit_ts)
+            })
+        });
+        println!("total number of panes: {}", panes.len());
+
+        let docks = self.all_docks();
+        let docks_iter = docks.iter().filter_map(|d| {
+            // Read dock state once and extract what we need
+            let (is_open, last_visit_ts, position) = {
+                let dock_read = d.read(cx);
+                (dock_read.is_open(), dock_read.last_visit_ts, dock_read.position())
+            };
+
+            if !is_open {
+                #[cfg(debug_assertions)]
+                println!("dock {:?} ({}) closed", position, debug_color_name(d.read(cx).debug_color));
+                #[cfg(not(debug_assertions))]
+                println!("dock {:?} closed", position);
+                return None;
+            }
+
+            self.bounding_box_for_dock(d, window, cx).map(|b| {
+                #[cfg(debug_assertions)]
+                println!(
+                    "candidate dock {:?} ({}) -> {:?}",
+                    position,
+                    debug_color_name(d.read(cx).debug_color),
+                    b
+                );
+                #[cfg(not(debug_assertions))]
+                println!("candidate dock {:?} -> {:?}", position, b);
+                FocusTarget::Dock(d, b, last_visit_ts)
+            })
+        });
+        println!("total number of docks: {}", docks.len());
+
+        let mut best: Option<FocusTarget> = None;
+        let mut best_dist = f32::MAX;
+        let mut best_ts = 0;
+
+        for target in panes_iter.chain(docks_iter) {
+            let (bounds, ts) = match &target {
+                FocusTarget::Pane(p, b, ts) => {
+                    #[cfg(debug_assertions)]
+                    println!(
+                        "checking pane {:?} ({}) bounds {:?}",
+                        Entity::entity_id(p),
+                        debug_color_name(p.read(cx).debug_color),
+                        b
+                    );
+                    #[cfg(not(debug_assertions))]
+                    println!("checking pane {:?} bounds {:?}", Entity::entity_id(p), b);
+                    (*b, *ts)
+                }
+                FocusTarget::Dock(d, b, ts) => {
+                    let dock_read = d.read(cx);
+                    let pos = dock_read.position();
+                    #[cfg(debug_assertions)]
+                    println!("checking dock {:?} ({}) bounds {:?}", pos, debug_color_name(dock_read.debug_color), b);
+                    #[cfg(not(debug_assertions))]
+                    println!("checking dock {:?} bounds {:?}", pos, b);
+                    (*b, *ts)
+                }
+            };
+
+            if bounds == origin {
+                continue;
+            }
+
+            let (adjacent, dist) = Self::distance_if_adjacent(&origin, &bounds, direction);
+            println!("  origin={:?}, target={:?}, direction={:?}", origin, bounds, direction);
+            println!("  adjacent={} dist={}", adjacent, dist);
+            if !adjacent {
+                continue;
+            }
+
+            if dist < best_dist || (dist == best_dist && ts > best_ts) {
+                best_dist = dist;
+                best_ts = ts;
+                best = Some(target);
+            }
+        }
+        if let Some(best) = best {
+            match &best {
+                FocusTarget::Pane(p, _, _) => {
+                    #[cfg(debug_assertions)]
+                    println!(
+                        "best target pane {:?} ({})",
+                        Entity::entity_id(p),
+                        debug_color_name(p.read(cx).debug_color)
+                    );
+                    #[cfg(not(debug_assertions))]
+                    println!("best target pane {:?}", Entity::entity_id(p));
+                }
+                FocusTarget::Dock(d, _, _) => {
+                    let dock_read = d.read(cx);
+                    #[cfg(debug_assertions)]
+                    println!(
+                        "best target dock {:?} ({})",
+                        dock_read.position(),
+                        debug_color_name(dock_read.debug_color)
+                    );
+                    #[cfg(not(debug_assertions))]
+                    println!("best target dock {:?}", dock_read.position());
+                }
+            }
+            return Some(best);
+        }
+
+        // No target found in the intended direction, try circular navigation
+        println!("no direct target found, trying circular navigation");
+
+        let mut best: Option<FocusTarget> = None;
+        let mut best_extreme_pos = match direction {
+            SplitDirection::Right => f32::MAX,  // looking for leftmost (minimum x)
+            SplitDirection::Left => f32::MIN,   // looking for rightmost (maximum x)
+            SplitDirection::Down => f32::MAX,   // looking for topmost (minimum y)
+            SplitDirection::Up => f32::MIN,     // looking for bottommost (maximum y)
+        };
+        let mut best_ts = 0;
+
+        // Rebuild the iterator for circular search
+        let panes_iter = panes.iter().filter_map(|p| {
+            self.bounding_box_for_pane(p).map(|b| {
+                #[cfg(debug_assertions)]
+                println!(
+                    "circular candidate pane {:?} ({}) -> {:?}",
+                    Entity::entity_id(p),
+                    debug_color_name(p.read(cx).debug_color),
+                    b
+                );
+                #[cfg(not(debug_assertions))]
+                println!("circular candidate pane {:?} -> {:?}", Entity::entity_id(p), b);
+                FocusTarget::Pane(p, b, p.read(cx).last_visit_ts)
+            })
+        });
+
+        let docks_iter = docks.iter().filter_map(|d| {
+            let (is_open, last_visit_ts, position) = {
+                let dock_read = d.read(cx);
+                (dock_read.is_open(), dock_read.last_visit_ts, dock_read.position())
+            };
+
+            if !is_open {
+                return None;
+            }
+
+            self.bounding_box_for_dock(d, window, cx).map(|b| {
+                #[cfg(debug_assertions)]
+                println!(
+                    "circular candidate dock {:?} ({}) -> {:?}",
+                    position,
+                    debug_color_name(d.read(cx).debug_color),
+                    b
+                );
+                #[cfg(not(debug_assertions))]
+                println!("circular candidate dock {:?} -> {:?}", position, b);
+                FocusTarget::Dock(d, b, last_visit_ts)
+            })
+        });
+
+        for target in panes_iter.chain(docks_iter) {
+            let (bounds, ts) = match &target {
+                FocusTarget::Pane(p, b, ts) => {
+                    #[cfg(debug_assertions)]
+                    println!(
+                        "circular checking pane {:?} ({}) bounds {:?}",
+                        Entity::entity_id(p),
+                        debug_color_name(p.read(cx).debug_color),
+                        b
+                    );
+                    #[cfg(not(debug_assertions))]
+                    println!("circular checking pane {:?} bounds {:?}", Entity::entity_id(p), b);
+                    (*b, *ts)
+                }
+                FocusTarget::Dock(d, b, ts) => {
+                    let dock_read = d.read(cx);
+                    let pos = dock_read.position();
+                    #[cfg(debug_assertions)]
+                    println!(
+                        "circular checking dock {:?} ({}) bounds {:?}",
+                        pos,
+                        debug_color_name(dock_read.debug_color),
+                        b
+                    );
+                    #[cfg(not(debug_assertions))]
+                    println!("circular checking dock {:?} bounds {:?}", pos, b);
+                    (*b, *ts)
+                }
+            };
+
+            if bounds == origin {
+                continue;
+            }
+
+            // For circular navigation, find the most extreme position in the opposite direction
+            // But only consider targets that have the right overlap for the navigation axis
+            let (target_pos, is_better, has_required_overlap) = match direction {
+                SplitDirection::Right => {
+                    // Going right, wrap to leftmost, but must have significant vertical overlap
+                    let pos = bounds.left().0;
+                    let overlap = Self::significant_vertical_overlap(bounds, origin);
+                    println!("  circular right->left: target pos={}, best_extreme_pos={}, significant_vertical_overlap={}", pos, best_extreme_pos, overlap);
+                    (pos, pos < best_extreme_pos, overlap)
+                },
+                SplitDirection::Left => {
+                    // Going left, wrap to rightmost, but must have significant vertical overlap
+                    let pos = bounds.right().0;
+                    let overlap = Self::significant_vertical_overlap(bounds, origin);
+                    println!("  circular left->right: target pos={}, best_extreme_pos={}, significant_vertical_overlap={}", pos, best_extreme_pos, overlap);
+                    (pos, pos > best_extreme_pos, overlap)
+                },
+                SplitDirection::Down => {
+                    // Going down, wrap to topmost, but must have significant horizontal overlap
+                    let pos = bounds.top().0;
+                    let overlap = Self::significant_horizontal_overlap(bounds, origin);
+                    println!("  circular down->up: target pos={}, best_extreme_pos={}, significant_horizontal_overlap={}", pos, best_extreme_pos, overlap);
+                    (pos, pos < best_extreme_pos, overlap)
+                },
+                SplitDirection::Up => {
+                    // Going up, wrap to bottommost, but must have significant horizontal overlap
+                    let pos = bounds.bottom().0;
+                    let overlap = Self::significant_horizontal_overlap(bounds, origin);
+                    println!("  circular up->down: target pos={}, best_extreme_pos={}, significant_horizontal_overlap={}", pos, best_extreme_pos, overlap);
+                    (pos, pos > best_extreme_pos, overlap)
+                },
+            };
+
+            if !has_required_overlap {
+                println!("  circular: skipping due to no overlap");
+                continue;
+            }
+
+            if is_better || (target_pos == best_extreme_pos && ts > best_ts) {
+                best_extreme_pos = target_pos;
+                best_ts = ts;
+                best = Some(target);
+                println!("  circular: new best target");
+            }
+        }
+
+        if let Some(best) = &best {
+            match best {
+                FocusTarget::Pane(p, _, _) => {
+                    #[cfg(debug_assertions)]
+                    println!(
+                        "circular best target pane {:?} ({})",
+                        Entity::entity_id(p),
+                        debug_color_name(p.read(cx).debug_color)
+                    );
+                    #[cfg(not(debug_assertions))]
+                    println!("circular best target pane {:?}", Entity::entity_id(p));
+                }
+                FocusTarget::Dock(d, _, _) => {
+                    let dock_read = d.read(cx);
+                    #[cfg(debug_assertions)]
+                    println!(
+                        "circular best target dock {:?} ({})",
+                        dock_read.position(),
+                        debug_color_name(dock_read.debug_color)
+                    );
+                    #[cfg(not(debug_assertions))]
+                    println!("circular best target dock {:?}", dock_read.position());
+                }
+            }
+        } else {
+            println!("no circular target found either - staying in place");
+        }
+
+        best
+    }
+
+    pub fn find_pane_in_direction(
+        &mut self,
+        direction: SplitDirection,
+        cx: &App,
+    ) -> Option<Entity<Pane>> {
+        self.center
+            .find_pane_in_direction(&self.active_pane, direction, cx)
+            .cloned()
     }
 
     pub fn move_item_to_pane_in_direction(
@@ -3539,17 +3946,94 @@ impl Workspace {
     }
 
     pub fn bounding_box_for_pane(&self, pane: &Entity<Pane>) -> Option<Bounds<Pixels>> {
-        self.center.bounding_box_for_pane(pane)
+        let bounds = self.center.bounding_box_for_pane(pane);
+        println!("bounding_box_for_pane for {:?}: {:?}", Entity::entity_id(pane), bounds);
+        bounds
     }
 
-    pub fn find_pane_in_direction(
-        &mut self,
-        direction: SplitDirection,
+    /// Bounding box of a dock's *visible chrome*.
+    pub fn bounding_box_for_dock(
+        &self,
+        dock: &Entity<Dock>,
+        _window: &Window,
         cx: &App,
-    ) -> Option<Entity<Pane>> {
-        self.center
-            .find_pane_in_direction(&self.active_pane, direction, cx)
-            .cloned()
+    ) -> Option<Bounds<Pixels>> {
+        // Get dock info in a scoped read to avoid conflicts
+        let (is_open, position) = {
+            let dock_read = dock.read(cx);
+            (dock_read.is_open(), dock_read.position())
+        };
+
+        log::debug!("bounding box for dock {:?}, open={}", position, is_open);
+
+        if !is_open {
+            return None;
+        }
+
+        // Get the actual dock size instead of using hardcoded fallbacks
+        let panel_size = dock.read(cx).active_panel_size(_window, cx).unwrap_or_else(|| {
+            // Fallback to reasonable defaults if no active panel
+            match position {
+                DockPosition::Left | DockPosition::Right => px(300.0),
+                DockPosition::Bottom => px(250.0),
+            }
+        });
+
+        let window_bounds = _window.window_bounds().get_bounds();
+        println!("workspace bounds: {:?}", self.bounds);
+        println!("window bounds: {:?}", window_bounds);
+        
+        // Use window bounds instead of workspace bounds for more accurate sizing
+        let workspace_bounds = window_bounds;
+        
+        // Calculate dock bounds based on position and panel size
+        let bounds = match position {
+            DockPosition::Left => Some(Bounds {
+                origin: workspace_bounds.origin,
+                size: Size {
+                    width: panel_size,
+                    height: workspace_bounds.size.height,
+                },
+            }),
+            DockPosition::Right => Some(Bounds {
+                origin: Point {
+                    x: workspace_bounds.origin.x + workspace_bounds.size.width - panel_size,
+                    y: workspace_bounds.origin.y,
+                },
+                size: Size {
+                    width: panel_size,
+                    height: workspace_bounds.size.height,
+                },
+            }),
+            DockPosition::Bottom => {
+                // Calculate bottom dock position accounting for left and right docks
+                let left_dock_width = if self.left_dock.read(cx).is_open() {
+                    self.left_dock.read(cx).active_panel_size(_window, cx).unwrap_or(px(0.0))
+                } else {
+                    px(0.0)
+                };
+                
+                let right_dock_width = if self.right_dock.read(cx).is_open() {
+                    self.right_dock.read(cx).active_panel_size(_window, cx).unwrap_or(px(0.0))
+                } else {
+                    px(0.0)
+                };
+                
+                Some(Bounds {
+                    origin: Point {
+                        x: workspace_bounds.origin.x + left_dock_width,
+                        y: workspace_bounds.origin.y + workspace_bounds.size.height - panel_size,
+                    },
+                    size: Size {
+                        width: workspace_bounds.size.width - left_dock_width - right_dock_width,
+                        height: panel_size,
+                    },
+                })
+            },
+        };
+
+        log::debug!("bounds for dock {:?}: {:?}", position, bounds);
+        bounds
     }
 
     pub fn swap_pane_in_direction(&mut self, direction: SplitDirection, cx: &mut Context<Self>) {
@@ -3598,6 +4082,12 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // Record pane visit for navigation tie-breaking.
+        let ts = self
+            .pane_history_timestamp
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        pane.update(cx, |pane, _| pane.last_visit_ts = ts);
+
         // This is explicitly hoisted out of the following check for pane identity as
         // terminal panel panes are not registered as a center panes.
         self.status_bar.update(cx, |status_bar, cx| {
@@ -5728,9 +6218,10 @@ fn open_items(
     })
 }
 
-enum ActivateInDirectionTarget {
-    Pane(Entity<Pane>),
-    Dock(Entity<Dock>),
+/// A focusable rectangle plus its visit-timestamp.
+enum FocusTarget<'a> {
+    Pane(&'a Entity<Pane>, Bounds<Pixels>, usize),
+    Dock(&'a Entity<Dock>, Bounds<Pixels>, usize),
 }
 
 fn notify_if_database_failed(workspace: WindowHandle<Workspace>, cx: &mut AsyncApp) {
@@ -5855,6 +6346,9 @@ impl Render for Workspace {
                                             this.update(cx, |this, cx| {
                                                 let bounds_changed = this.bounds != bounds;
                                                 this.bounds = bounds;
+                                                
+                                                // Update center pane group bounds for single pane navigation
+                                                this.center.set_single_pane_bounds(bounds);
 
                                                 if bounds_changed {
                                                     this.left_dock.update(cx, |dock, cx| {
@@ -6196,7 +6690,104 @@ impl Render for Workspace {
                                         }
                                     })
                                 }))
-                                .children(self.render_notifications(window, cx)),
+                                .children(self.render_notifications(window, cx))
+                                .child({
+                                    #[cfg(debug_assertions)]
+                                    {
+                                        use gpui::{PathBuilder, px, point, SharedString};
+                                        
+                                        // Debug grid overlay to visualize position coordinates
+                                        div()
+                                            .absolute()
+                                            .top_0()
+                                            .left_0()
+                                            .size_full()
+                                            .stop_mouse_events_except_scroll()
+                                            .child({
+                                                // Grid lines layer
+                                                canvas(
+                                                    move |_bounds, _window, _cx| {
+                                                        // No prepaint state needed
+                                                    },
+                                                    move |bounds, _state, window, _cx| {
+                                                        // Draw debug grid
+                                                        let grid_size = px(50.0); // 50px grid
+                                                        let line_color = gpui::rgba(0x00FF0030); // More subtle green
+                                                        
+                                                        // Draw vertical lines
+                                                        let mut x = px(0.0);
+                                                        while x <= bounds.size.width {
+                                                            let mut builder = PathBuilder::stroke(px(1.0));
+                                                            builder.move_to(point(bounds.origin.x + x, bounds.origin.y));
+                                                            builder.line_to(point(bounds.origin.x + x, bounds.origin.y + bounds.size.height));
+                                                            if let Ok(path) = builder.build() {
+                                                                window.paint_path(path, line_color);
+                                                            }
+                                                            x += grid_size;
+                                                        }
+                                                        
+                                                        // Draw horizontal lines
+                                                        let mut y = px(0.0);
+                                                        while y <= bounds.size.height {
+                                                            let mut builder = PathBuilder::stroke(px(1.0));
+                                                            builder.move_to(point(bounds.origin.x, bounds.origin.y + y));
+                                                            builder.line_to(point(bounds.origin.x + bounds.size.width, bounds.origin.y + y));
+                                                            if let Ok(path) = builder.build() {
+                                                                window.paint_path(path, line_color);
+                                                            }
+                                                            y += grid_size;
+                                                        }
+                                                    },
+                                                )
+                                                .size_full()
+                                            })
+                                            .children({
+                                                // Coordinate labels layer
+                                                let mut labels = Vec::new();
+                                                let grid_size = 50.0; // px
+                                                
+                                                // X-axis labels along top
+                                                let mut x = grid_size;
+                                                while x <= 2000.0 { // Reasonable max width
+                                                    labels.push(
+                                                        div()
+                                                            .absolute()
+                                                            .left(px(x + 2.0))
+                                                            .top(px(2.0))
+                                                            .text_xs()
+                                                            .text_color(gpui::rgba(0x00FF0060)) // More subtle green text
+                                                            .bg(gpui::rgba(0x00000040)) // More subtle black background
+                                                            .px_1()
+                                                            .child(format!("{:.0}", x))
+                                                    );
+                                                    x += grid_size;
+                                                }
+                                                
+                                                // Y-axis labels along left
+                                                let mut y = grid_size;
+                                                while y <= 2000.0 { // Reasonable max height
+                                                    labels.push(
+                                                        div()
+                                                            .absolute()
+                                                            .left(px(2.0))
+                                                            .top(px(y + 2.0))
+                                                            .text_xs()
+                                                            .text_color(gpui::rgba(0x00FF0060)) // More subtle green text
+                                                            .bg(gpui::rgba(0x00000040)) // More subtle black background
+                                                            .px_1()
+                                                            .child(format!("{:.0}", y))
+                                                    );
+                                                    y += grid_size;
+                                                }
+                                                
+                                                labels
+                                            })
+                                    }
+                                    #[cfg(not(debug_assertions))]
+                                    {
+                                        div() // Empty div when not in debug mode
+                                    }
+                                }),
                         )
                         .child(self.status_bar.clone())
                         .child(self.modal_layer.clone())
